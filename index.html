@@ -25,14 +25,26 @@ canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
 .volume-controls label { display: inline-block; width: 80px; color: #aaa; font-size: 14px; text-align: right; margin-right: 10px; }
 .volume-controls input[type="range"] { width: 120px; vertical-align: middle; accent-color: #e03030; }
 .volume-controls .vol-val { display: inline-block; width: 36px; color: #ff0; font-size: 14px; text-align: left; }
+.mode-select { display: flex; gap: 30px; margin-top: 20px; justify-content: center; }
+.mode-btn { font-size: 20px; color: #fff; padding: 12px 30px; border: 2px solid #e03030; cursor: pointer; transition: all 0.2s; user-select: none; background: transparent; }
+.mode-btn:hover { background: #e03030; color: #fff; }
+#mpServerInput { background: rgba(255,255,255,0.1); border: 1px solid #666; color: #fff; font-size: 14px; padding: 6px 10px; width: 240px; text-align: center; margin-top: 10px; font-family: 'Courier New', monospace; }
 #mobileControls { position: absolute; bottom: 10px; left: 0; right: 0; display: none; justify-content: space-between; padding: 0 20px; z-index: 5; }
 #mobileControls button { background: rgba(255,255,255,0.2); border: 2px solid rgba(255,255,255,0.4); color: #fff; font-size: 18px; padding: 15px 20px; border-radius: 10px; touch-action: manipulation; user-select: none; }
 #dpad { display: flex; gap: 5px; }
 #actionBtns { display: flex; gap: 10px; }
 @media (max-width: 768px) { #mobileControls { display: flex; } }
+#scoreboard { position: absolute; top: 10px; right: 20px; color: #fff; font-size: 16px; font-family: 'Courier New', monospace; z-index: 20; display: none; text-shadow: 2px 2px 0 #000; background: rgba(0,0,0,0.5); padding: 6px 14px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); }
 </style>
 </head>
 <body>
+
+<div id="scoreboard">胜率：0/0</div>
+
+<div id="waitingOverlay" style="position:absolute;top:0;left:0;width:100%;height:100%;display:none;flex-direction:column;justify-content:center;align-items:center;color:#fff;font-family:'Courier New',monospace;z-index:15;background:rgba(0,0,0,0.6);pointer-events:none;">
+<div style="font-size:36px;color:#f44;margin-bottom:20px;">你已阵亡</div>
+<div class="blink" style="font-size:18px;">对方仍在游戏中，请耐心等候</div>
+</div>
 
 <div id="startScreen">
 <h1>魂斗罗</h1>
@@ -46,13 +58,31 @@ canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
 <label>BGM 音量</label><input type="range" id="bgmSlider" min="0" max="100" value="50"><span class="vol-val" id="bgmVal">50</span><br>
 <label>游戏音量</label><input type="range" id="sfxSlider" min="0" max="100" value="50"><span class="vol-val" id="sfxVal">50</span>
 </div>
-<div class="blink">按 ENTER 开始游戏</div>
+<div class="mode-select">
+<div class="mode-btn" id="btnSingle">单人游戏</div>
+<div class="mode-btn" id="btnBattle">双人对战</div>
+</div>
+<div id="mpStatus" style="display:none; margin-top:15px;">
+<input id="mpServerInput" type="text" placeholder="服务器地址 (如 ws://1.2.3.4:8080)" style="display:none;">
+<div id="mpStatusText" class="blink" style="font-size:18px; color:#0ff; margin-top:10px;"></div>
+<div id="mpCountdown" style="font-size:48px; color:#ff0; margin-top:10px; display:none;"></div>
+</div>
 </div>
 
 <div id="gameOverScreen">
 <h1>GAME OVER</h1>
 <div class="score">得分: <span id="finalScore">0</span></div>
 <div class="blink">按 ENTER 重新开始</div>
+</div>
+
+<div id="battleResultScreen" style="position:absolute;top:0;left:0;width:100%;height:100%;display:none;flex-direction:column;justify-content:center;align-items:center;color:#fff;font-family:'Courier New',monospace;z-index:10;background:rgba(0,0,0,0.9);">
+<h1 id="battleResultTitle" style="font-size:48px;margin-bottom:30px;"></h1>
+<div id="battleResultDetails" style="font-size:18px;line-height:2;text-align:center;"></div>
+<div id="battleResultVoteStatus" style="margin-top:20px;font-size:16px;color:#0ff;min-height:24px;"></div>
+<div id="battleResultBtns" style="display:flex;gap:30px;margin-top:20px;">
+<div class="mode-btn" id="btnRematch">再来一局</div>
+<div class="mode-btn" id="btnEndBattle">结束对战</div>
+</div>
 </div>
 
 <canvas id="game"></canvas>
@@ -422,8 +452,9 @@ const keys = {};
 document.addEventListener('keydown', e => { keys[e.code] = true; e.preventDefault(); });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
-// 秘籍检测：连续输入 yff 切换简单模式
+// 秘籍检测：连续输入 yff 切换简单模式（双人模式禁用）
 document.addEventListener('keydown', e => {
+    if (multiplayerMode) return;
     cheatBuffer.push(e.key.toLowerCase());
     if (cheatBuffer.length > 10) cheatBuffer.shift();
     const seq = cheatBuffer.join('');
@@ -441,6 +472,260 @@ document.addEventListener('keydown', e => {
         }
     }
 });
+
+// ========== 多人对战 WebSocket ==========
+function getServerUrl() {
+    const input = document.getElementById('mpServerInput');
+    const val = input.value.trim();
+    if (val) return val;
+    // 默认连接当前页面同源
+    const loc = window.location;
+    if (loc.protocol === 'file:') return 'ws://localhost:3000';
+    const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = loc.port ? `${loc.hostname}:${loc.port}` : loc.hostname;
+    return `${wsProtocol}//${host}`;
+}
+
+function showShareUrl(url) {
+    const statusDiv = document.getElementById('mpStatusText');
+    statusDiv.innerHTML =
+        '<div style="font-size:14px;color:#aaa;margin-bottom:6px;">分享此地址给对手：</div>' +
+        '<div style="display:flex;align-items:center;justify-content:center;gap:8px;">' +
+        '<input id="publicUrlInput" type="text" value="' + url + '" readonly ' +
+        'style="background:rgba(255,255,255,0.1);border:1px solid #0ff;color:#0ff;font-size:16px;padding:6px 10px;width:260px;text-align:center;font-family:monospace;cursor:pointer;" ' +
+        'onclick="this.select()">' +
+        '<button id="copyUrlBtn" ' +
+        'style="background:#e03030;border:none;color:#fff;padding:6px 14px;cursor:pointer;font-size:14px;">复制</button>' +
+        '</div>';
+    document.getElementById('copyUrlBtn').addEventListener('click', () => {
+        const input = document.getElementById('publicUrlInput');
+        input.select();
+        navigator.clipboard.writeText(input.value).then(() => {
+            document.getElementById('copyUrlBtn').textContent = '已复制';
+            setTimeout(() => { document.getElementById('copyUrlBtn').textContent = '复制'; }, 1500);
+        });
+    });
+}
+
+function fetchPublicUrl() {
+    const baseUrl = getServerUrl().replace(/^ws/, 'http').replace(/\/$/, '');
+    fetch(baseUrl + '/api/url')
+        .then(r => r.json())
+        .then(data => {
+            if (data.url) {
+                showShareUrl(data.url);
+            } else {
+                showShareUrl(window.location.href);
+            }
+        })
+        .catch(() => {
+            showShareUrl(window.location.href);
+        });
+}
+
+function connectBattleServer() {
+    const url = getServerUrl();
+    document.getElementById('mpStatus').style.display = 'block';
+    document.getElementById('mpStatusText').textContent = '正在连接服务器...';
+
+    // 获取公网地址并显示
+    fetchPublicUrl();
+
+    try {
+        ws = new WebSocket(url);
+    } catch (e) {
+        document.getElementById('mpStatusText').textContent = '无法连接服务器';
+        return;
+    }
+
+    ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join' }));
+        battleState = 'waiting';
+        document.getElementById('mpStatusText').textContent = '正在匹配对手...';
+    };
+
+    ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        handleBattleMessage(msg);
+    };
+
+    ws.onclose = () => {
+        if (battleState === 'waiting' || battleState === 'matched') {
+            resetBattleState();
+            document.getElementById('mpStatusText').textContent = '连接断开';
+            setTimeout(() => {
+                document.getElementById('mpStatus').style.display = 'none';
+            }, 2000);
+        }
+    };
+
+    ws.onerror = () => {
+        document.getElementById('mpStatusText').textContent = '无法连接服务器，请检查地址';
+        setTimeout(() => resetBattleState(), 2000);
+    };
+}
+
+function handleBattleMessage(msg) {
+    switch (msg.type) {
+        case 'waiting':
+            document.getElementById('mpStatusText').textContent = '正在匹配对手...';
+            break;
+
+        case 'matched':
+            battleState = 'matched';
+            document.getElementById('mpStatusText').textContent = '已匹配！等待双方就绪...';
+            // 自动向服务器确认就绪
+            ws.send(JSON.stringify({ type: 'ready' }));
+            break;
+
+        case 'opponent_ready':
+            document.getElementById('mpStatusText').textContent = '对手已就绪，等待你确认...';
+            break;
+
+        case 'countdown':
+            battleState = 'countdown';
+            document.getElementById('mpCountdown').style.display = 'block';
+            document.getElementById('mpCountdown').textContent = msg.count;
+            document.getElementById('mpStatusText').textContent = '对战即将开始';
+            break;
+
+        case 'start':
+            battleState = 'playing';
+            multiplayerMode = true;
+            state = 'playing';
+            initGame();
+            document.getElementById('startScreen').style.display = 'none';
+            document.getElementById('mpCountdown').style.display = 'none';
+            document.getElementById('mpStatus').style.display = 'none';
+            document.getElementById('scoreboard').style.display = 'block';
+            startBGM();
+            break;
+
+        case 'opponent_result':
+            opponentResult = msg;
+            break;
+
+        case 'battle_result':
+            battleResult = msg;
+            showBattleResult(msg);
+            break;
+
+        case 'opponent_rematch':
+            document.getElementById('battleResultVoteStatus').textContent = '对手想再来一局！';
+            break;
+
+        case 'opponent_end':
+            document.getElementById('battleResultVoteStatus').textContent = '对手结束了对战';
+            setTimeout(() => {
+                resetBattleState();
+                document.getElementById('battleResultScreen').style.display = 'none';
+                state = 'start';
+                document.getElementById('startScreen').style.display = 'flex';
+                stopBGM();
+            }, 1500);
+            break;
+
+        case 'restart':
+            document.getElementById('battleResultScreen').style.display = 'none';
+            document.getElementById('mpStatus').style.display = 'block';
+            document.getElementById('mpStatusText').textContent = '对手已就绪，准备再来一局！';
+            document.getElementById('mpCountdown').style.display = 'none';
+            battleState = 'matched';
+            opponentResult = null;
+            battleResult = null;
+            ws.send(JSON.stringify({ type: 'ready' }));
+            break;
+
+        case 'score_update':
+            document.getElementById('scoreboard').textContent = '胜率：' + msg.myWins + '/' + msg.totalGames;
+            break;
+    }
+}
+
+function sendBattleResult(outcome) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || battleState !== 'playing') return;
+    battleState = 'finished';
+    ws.send(JSON.stringify({
+        type: 'result',
+        outcome: outcome,
+        score: score,
+        frames: frameCount
+    }));
+}
+
+function showBattleResult(result) {
+    document.getElementById('gameOverScreen').style.display = 'none';
+    document.getElementById('waitingOverlay').style.display = 'none';
+
+    const title = document.getElementById('battleResultTitle');
+    const details = document.getElementById('battleResultDetails');
+
+    if (result.winner === 'draw') {
+        title.textContent = '平局!';
+        title.style.color = '#ff0';
+    } else if (result.winner === 'self') {
+        title.textContent = '你赢了!';
+        title.style.color = '#0f0';
+    } else {
+        title.textContent = '你输了!';
+        title.style.color = '#f44';
+    }
+
+    const selfData = result.self;
+    const oppData = result.opponent;
+
+    const formatTime = (frames) => (frames / 60).toFixed(1) + 's';
+    const formatOutcome = (oc) => oc === 'victory' ? '通关' : oc === 'disconnect' ? '断线' : '失败';
+
+    details.innerHTML =
+        '<div style="display:flex;gap:60px;">' +
+        '<div>' +
+        '<div style="color:#0ff;font-size:24px;">你</div>' +
+        '<div>结果: ' + formatOutcome(selfData.outcome) + '</div>' +
+        '<div>得分: ' + selfData.score + '</div>' +
+        '<div>用时: ' + (selfData.outcome === 'victory' ? formatTime(selfData.frames) : '-') + '</div>' +
+        '</div>' +
+        '<div>' +
+        '<div style="color:#f80;font-size:24px;">对手</div>' +
+        '<div>结果: ' + formatOutcome(oppData.outcome) + '</div>' +
+        '<div>得分: ' + oppData.score + '</div>' +
+        '<div>用时: ' + (oppData.outcome === 'victory' ? formatTime(oppData.frames) : '-') + '</div>' +
+        '</div>' +
+        '</div>';
+
+    state = 'battleresult';
+    document.getElementById('battleResultScreen').style.display = 'flex';
+    document.getElementById('battleResultVoteStatus').textContent = '';
+    document.getElementById('battleResultBtns').style.display = 'flex';
+
+    document.getElementById('btnRematch').onclick = () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'rematch' }));
+            document.getElementById('battleResultVoteStatus').textContent = '你选择了再来一局，等待对手选择...';
+            document.getElementById('battleResultBtns').style.display = 'none';
+        }
+    };
+    document.getElementById('btnEndBattle').onclick = () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'end' }));
+        }
+        resetBattleState();
+        document.getElementById('battleResultScreen').style.display = 'none';
+        state = 'start';
+        document.getElementById('startScreen').style.display = 'flex';
+        stopBGM();
+    };
+}
+
+function resetBattleState() {
+    multiplayerMode = false;
+    battleState = 'idle';
+    opponentResult = null;
+    battleResult = null;
+    document.getElementById('scoreboard').style.display = 'none';
+    document.getElementById('waitingOverlay').style.display = 'none';
+    if (ws) { ws.close(); ws = null; }
+}
 
 // 移动端控制
 const touchState = { left: false, right: false, up: false, down: false, jump: false, fire: false };
@@ -1498,7 +1783,7 @@ function drawParticles(camX) {
 }
 
 // ========== 游戏状态 ==========
-let state = 'start'; // start, playing, paused, gameover, victory
+let state = 'start'; // start, playing, paused, gameover, victory, battleresult
 let level, player, bullets, enemyBullets, enemies, powerups, boss;
 let camera, score, lives, hiScore = 0;
 let screenShake = 0;
@@ -1512,6 +1797,14 @@ let waterBoss = null;
 let waterBossIntro = false;
 let cameraLocked = false;
 let cameraLockX = 0;
+
+// ========== 多人对战 ==========
+let multiplayerMode = false;
+let ws = null;
+let frameCount = 0;
+let battleState = 'idle'; // idle, waiting, matched, countdown, playing, finished
+let opponentResult = null;
+let battleResult = null;
 
 // 暴风雨系统
 let stormTimer = 0;
@@ -1615,6 +1908,9 @@ function initGame() {
     bossTriggered = false;
     boss = null;
     victoryTimer = 0;
+    frameCount = 0;
+    opponentResult = null;
+    battleResult = null;
     dynamicSpawnTimer = 60;
     waterBoss = null;
     waterBossIntro = false;
@@ -2343,6 +2639,7 @@ function updateBullets() {
                         state = 'victory';
                         stopBGM();
                         victoryTimer = 180;
+                        if (multiplayerMode) sendBattleResult('victory');
                     }
                 }
             }
@@ -2441,6 +2738,7 @@ function updateBullets() {
                     state = 'victory';
                     stopBGM();
                     victoryTimer = 180;
+                    if (multiplayerMode) sendBattleResult('victory');
                 }
                 hit = true;
             }
@@ -3036,11 +3334,16 @@ function playerDie() {
 
     if (lives <= 0) {
         setTimeout(() => {
-            state = 'gameover';
             stopBGM();
-            document.getElementById('finalScore').textContent = score;
-            document.getElementById('gameOverScreen').style.display = 'flex';
             if (score > hiScore) hiScore = score;
+            if (multiplayerMode) {
+                sendBattleResult('gameover');
+                document.getElementById('waitingOverlay').style.display = 'flex';
+            } else {
+                state = 'gameover';
+                document.getElementById('finalScore').textContent = score;
+                document.getElementById('gameOverScreen').style.display = 'flex';
+            }
         }, 1000);
     } else {
         const deathX = player.x;
@@ -4381,6 +4684,7 @@ function gameLoop(timestamp) {
 
     // 更新
     if (state === 'playing') {
+        frameCount++;
         // 移动平台更新
         for (const mp of movingPlatforms) {
             const prevX = mp.x;
@@ -4433,9 +4737,19 @@ function gameLoop(timestamp) {
         updateParticles();
         victoryTimer--;
         if (victoryTimer <= 0) {
-            state = 'gameover';
-            document.getElementById('finalScore').textContent = score;
-            document.getElementById('gameOverScreen').style.display = 'flex';
+            if (multiplayerMode) {
+                state = 'battleresult';
+                if (!battleResult) {
+                    document.getElementById('battleResultTitle').textContent = '等待对手...';
+                    document.getElementById('battleResultTitle').style.color = '#0ff';
+                    document.getElementById('battleResultDetails').innerHTML = '';
+                    document.getElementById('battleResultScreen').style.display = 'flex';
+                }
+            } else {
+                state = 'gameover';
+                document.getElementById('finalScore').textContent = score;
+                document.getElementById('gameOverScreen').style.display = 'flex';
+            }
         }
     }
 
@@ -4504,6 +4818,19 @@ document.addEventListener('keydown', e => {
         state = state === 'playing' ? 'paused' : 'playing';
         if (state === 'paused') stopBGM(); else startBGM();
     }
+});
+
+// ========== 模式选择按钮 ==========
+document.getElementById('btnSingle').addEventListener('click', () => {
+    state = 'playing';
+    multiplayerMode = false;
+    initGame();
+    document.getElementById('startScreen').style.display = 'none';
+    startBGM();
+});
+
+document.getElementById('btnBattle').addEventListener('click', () => {
+    connectBattleServer();
 });
 
 // 启动
