@@ -61,6 +61,7 @@ canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
 <div class="mode-select">
 <div class="mode-btn" id="btnSingle">单人游戏</div>
 <div class="mode-btn" id="btnBattle">双人对战</div>
+<div class="mode-btn" id="btnCoop">双人协同</div>
 </div>
 <div id="mpStatus" style="display:none; margin-top:15px;">
 <input id="mpServerInput" type="text" placeholder="服务器地址 (如 ws://1.2.3.4:8080)" style="display:none;">
@@ -719,12 +720,266 @@ function showBattleResult(result) {
 
 function resetBattleState() {
     multiplayerMode = false;
+    coopMode = false;
+    coopRole = '';
+    coopPlayer2 = null;
+    coopInputQueue = [];
+    coopStateFromHost = null;
     battleState = 'idle';
     opponentResult = null;
     battleResult = null;
     document.getElementById('scoreboard').style.display = 'none';
     document.getElementById('waitingOverlay').style.display = 'none';
     if (ws) { ws.close(); ws = null; }
+}
+
+// ========== 协同模式：输入编码 ==========
+function encodeInput() {
+    let b = 0;
+    if (isKeyDown('up'))    b |= 1;
+    if (isKeyDown('down'))  b |= 2;
+    if (isKeyDown('left'))  b |= 4;
+    if (isKeyDown('right')) b |= 8;
+    if (isKeyDown('jump'))  b |= 16;
+    if (isKeyDown('fire'))  b |= 32;
+    return b;
+}
+
+function decodeCoopInput(byte) {
+    return {
+        up:    !!(byte & 1),
+        down:  !!(byte & 2),
+        left:  !!(byte & 4),
+        right: !!(byte & 8),
+        jump:  !!(byte & 16),
+        fire:  !!(byte & 32),
+    };
+}
+
+// ========== 协同模式：连接服务器 ==========
+function connectCoopServer() {
+    const url = getServerUrl();
+    document.getElementById('mpStatus').style.display = 'block';
+    document.getElementById('mpStatusText').textContent = '正在连接服务器...';
+    fetchPublicUrl();
+    try {
+        ws = new WebSocket(url);
+    } catch (e) {
+        document.getElementById('mpStatusText').textContent = '无法连接服务器';
+        return;
+    }
+    ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join_coop' }));
+        battleState = 'waiting';
+        document.getElementById('mpStatusText').textContent = '正在匹配协同伙伴...';
+    };
+    ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        handleCoopMessage(msg);
+    };
+    ws.onclose = () => {
+        if (battleState === 'waiting' || battleState === 'matched') {
+            resetBattleState();
+            document.getElementById('mpStatusText').textContent = '连接断开';
+            setTimeout(() => {
+                document.getElementById('mpStatus').style.display = 'none';
+            }, 2000);
+        }
+    };
+    ws.onerror = () => {
+        document.getElementById('mpStatusText').textContent = '无法连接服务器，请检查地址';
+        setTimeout(() => resetBattleState(), 2000);
+    };
+}
+
+// ========== 协同模式：消息处理 ==========
+function handleCoopMessage(msg) {
+    switch (msg.type) {
+        case 'waiting':
+            document.getElementById('mpStatusText').textContent = '正在匹配协同伙伴...';
+            break;
+        case 'matched_coop':
+            coopRole = msg.playerIndex === 0 ? 'host' : 'guest';
+            battleState = 'matched';
+            document.getElementById('mpStatusText').textContent = '已匹配！等待双方就绪...';
+            ws.send(JSON.stringify({ type: 'ready' }));
+            break;
+        case 'opponent_ready':
+            document.getElementById('mpStatusText').textContent = '伙伴已就绪，等待你确认...';
+            break;
+        case 'countdown':
+            battleState = 'countdown';
+            document.getElementById('mpCountdown').style.display = 'block';
+            document.getElementById('mpCountdown').textContent = msg.count;
+            document.getElementById('mpStatusText').textContent = '协同作战即将开始';
+            break;
+        case 'coop_start':
+            startCoopGame(msg.seed);
+            break;
+        case 'coop_input':
+            if (coopRole === 'host') {
+                coopInputQueue.push({ f: msg.f, k: msg.k });
+            }
+            break;
+        case 'coop_state':
+            if (coopRole === 'guest') {
+                coopStateFromHost = msg.state;
+            }
+            break;
+        case 'coop_gameover':
+            showCoopGameOver(msg);
+            break;
+        case 'coop_victory':
+            showCoopVictory(msg);
+            break;
+        case 'coop_partner_disconnect':
+            showCoopDisconnect('伙伴已断开连接');
+            break;
+        case 'coop_host_disconnect':
+            showCoopDisconnect('主机已断开连接');
+            break;
+    }
+}
+
+// ========== 协同模式：开始游戏 ==========
+function startCoopGame(seed) {
+    levelSeed = seed;
+    coopMode = true;
+    coopInputQueue = [];
+    coopStateFromHost = null;
+    coopStatePrev = null;
+    coopInterpT = 0;
+    coopInterpFrame = 0;
+    coopSendTimer = 0;
+    multiplayerMode = true;
+
+    initGame();
+
+    if (coopRole === 'host') {
+        const groundY = Math.floor(H / TILE) - 2;
+        coopPlayer2 = createPlayer2(5 * TILE, (groundY - 2) * TILE);
+    }
+
+    document.getElementById('startScreen').style.display = 'none';
+    document.getElementById('mpCountdown').style.display = 'none';
+    document.getElementById('mpStatus').style.display = 'none';
+    state = 'playing';
+    startBGM();
+}
+
+// ========== 协同模式：创建玩家2 ==========
+function createPlayer2(x, y) {
+    return {
+        x: x, y: y,
+        w: 20, h: 36,
+        vx: 0, vy: 0,
+        dir: 1,
+        onGround: false,
+        jumping: false,
+        jumpHeld: false,
+        ducking: false,
+        aimingUp: false,
+        aimDiag: false,
+        aimDiagDown: false,
+        aimDown: false,
+        weapon: 'spread',
+        obtainedWeapons: ['spread'],
+        rHeld: false,
+        fireTimer: 0,
+        fireRate: 20,
+        spiralAngle: 0,
+        invincible: 120,
+        animFrame: 0,
+        animTimer: 0,
+        dead: false,
+        inWater: false,
+        submerged: false,
+        jumpCount: 0,
+        lives: 3,
+        spectating: false,
+    };
+}
+
+// ========== 协同模式：结束画面 ==========
+function showCoopVictory(msg) {
+    state = 'battleresult';
+    stopBGM();
+    const title = document.getElementById('battleResultTitle');
+    title.textContent = '协同胜利!';
+    title.style.color = '#0f0';
+    document.getElementById('battleResultDetails').innerHTML =
+        '<div style="font-size:20px;color:#ff0;">得分: ' + msg.score + '</div>' +
+        '<div style="font-size:16px;color:#aaa;">用时: ' + (msg.frames / 60).toFixed(1) + 's</div>';
+    document.getElementById('battleResultScreen').style.display = 'flex';
+    document.getElementById('battleResultVoteStatus').textContent = '';
+    document.getElementById('battleResultBtns').style.display = 'flex';
+    document.getElementById('btnRematch').onclick = () => {
+        coopMode = false; coopRole = ''; coopPlayer2 = null;
+        coopInputQueue = []; coopStateFromHost = null;
+        document.getElementById('battleResultScreen').style.display = 'none';
+        document.getElementById('mpStatus').style.display = 'block';
+        document.getElementById('mpStatusText').textContent = '正在重新匹配...';
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'join_coop' }));
+        } else {
+            connectCoopServer();
+        }
+    };
+    document.getElementById('btnEndBattle').onclick = () => {
+        resetBattleState();
+        document.getElementById('battleResultScreen').style.display = 'none';
+        state = 'start';
+        document.getElementById('startScreen').style.display = 'flex';
+    };
+}
+
+function showCoopGameOver(msg) {
+    state = 'battleresult';
+    stopBGM();
+    const title = document.getElementById('battleResultTitle');
+    title.textContent = '任务失败';
+    title.style.color = '#f44';
+    document.getElementById('battleResultDetails').innerHTML =
+        '<div style="font-size:20px;color:#ff0;">得分: ' + msg.score + '</div>';
+    document.getElementById('battleResultScreen').style.display = 'flex';
+    document.getElementById('battleResultVoteStatus').textContent = '';
+    document.getElementById('battleResultBtns').style.display = 'flex';
+    document.getElementById('btnRematch').onclick = () => {
+        coopMode = false; coopRole = ''; coopPlayer2 = null;
+        coopInputQueue = []; coopStateFromHost = null;
+        document.getElementById('battleResultScreen').style.display = 'none';
+        document.getElementById('mpStatus').style.display = 'block';
+        document.getElementById('mpStatusText').textContent = '正在重新匹配...';
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'join_coop' }));
+        } else {
+            connectCoopServer();
+        }
+    };
+    document.getElementById('btnEndBattle').onclick = () => {
+        resetBattleState();
+        document.getElementById('battleResultScreen').style.display = 'none';
+        state = 'start';
+        document.getElementById('startScreen').style.display = 'flex';
+    };
+}
+
+function showCoopDisconnect(reason) {
+    state = 'battleresult';
+    stopBGM();
+    const title = document.getElementById('battleResultTitle');
+    title.textContent = reason;
+    title.style.color = '#f80';
+    document.getElementById('battleResultDetails').innerHTML = '';
+    document.getElementById('battleResultScreen').style.display = 'flex';
+    document.getElementById('battleResultVoteStatus').textContent = '';
+    document.getElementById('battleResultBtns').style.display = 'none';
+    setTimeout(() => {
+        resetBattleState();
+        document.getElementById('battleResultScreen').style.display = 'none';
+        state = 'start';
+        document.getElementById('startScreen').style.display = 'flex';
+    }, 3000);
 }
 
 // 移动端控制
@@ -1034,8 +1289,9 @@ function createAirborneEnemy(x) {
 // 空降兵慢速子弹
 function paratrooperFire(e) {
     const speed = 1.5; // 慢速子弹
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -1168,11 +1424,13 @@ function updateWaterBoss() {
             wb.y = WATER_SURFACE_Y - 8;
             wb.phase = 'wait';
             wb.waitTimer = 0;
-            wb.facing = (player.x + player.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
+            const _wbTgt = getNearestPlayerTarget(wb.x, wb.y);
+            wb.facing = (_wbTgt.x + _wbTgt.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
         }
     } else if (wb.phase === 'wait') {
         // 水面等待6秒，面向玩家
-        wb.facing = (player.x + player.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
+        const _wbTgt = getNearestPlayerTarget(wb.x, wb.y);
+        wb.facing = (_wbTgt.x + _wbTgt.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
         wb.waitTimer++;
         if (wb.waitTimer % 30 === 0) {
             spawnParticles(wb.x + wb.w / 2 + (Math.random() - 0.5) * 40, WATER_SURFACE_Y + 3, 2, '#4af', 1);
@@ -1181,7 +1439,8 @@ function updateWaterBoss() {
         if (wb.jumpsAtPos < 2 && wb.waitTimer >= 60 && wb.waitTimer % 120 === 60) {
             const torpedoX = wb.x + wb.w / 2;
             const torpedoY = WATER_SURFACE_Y + 10;
-            const dir = (player.x + player.w / 2 < torpedoX) ? -1 : 1;
+            const _wbTgt2 = getNearestPlayerTarget(wb.x, wb.y);
+            const dir = (_wbTgt2.x + _wbTgt2.w / 2 < torpedoX) ? -1 : 1;
             enemyBullets.push({
                 x: torpedoX, y: torpedoY,
                 vx: dir * 2.5, vy: 0,
@@ -1232,8 +1491,9 @@ function updateWaterBoss() {
             if (wb.fireTimer <= 0) {
                 wb.fireTimer = 25;
                 const bulletSpeed = 3;
-                let dx = player.x + player.w / 2 - wb.x - wb.w / 2;
-                let dy = player.y + player.h / 2 - wb.y - wb.h / 2;
+                const _wbTgt3 = getNearestPlayerTarget(wb.x, wb.y);
+                let dx = _wbTgt3.x + _wbTgt3.w / 2 - wb.x - wb.w / 2;
+                let dy = _wbTgt3.y + _wbTgt3.h / 2 - wb.y - wb.h / 2;
                 const d = Math.sqrt(dx * dx + dy * dy);
                 if (d > 10) {
                     dx /= d; dy /= d;
@@ -1276,7 +1536,8 @@ function updateWaterBoss() {
             wb.jumpsAtPos++;
             wb.phase = 'wait';
             wb.waitTimer = 0;
-            wb.facing = (player.x + player.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
+            const _wbTgt1 = getNearestPlayerTarget(wb.x, wb.y);
+            wb.facing = (_wbTgt1.x + _wbTgt1.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
             playSound('splash');
             spawnParticles(wb.x + wb.w / 2, WATER_SURFACE_Y, 20, '#4af', 5);
             spawnParticles(wb.x + wb.w / 2, WATER_SURFACE_Y, 10, '#fff', 4);
@@ -1297,7 +1558,8 @@ function updateWaterBoss() {
             wb.jumpsAtPos = 0;
             wb.phase = 'wait';
             wb.waitTimer = 0;
-            wb.facing = (player.x + player.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
+            const _wbTgt2 = getNearestPlayerTarget(wb.x, wb.y);
+            wb.facing = (_wbTgt2.x + _wbTgt2.w / 2 < wb.x + wb.w / 2) ? -1 : 1;
             playSound('splash');
             spawnParticles(wb.x + wb.w / 2, WATER_SURFACE_Y, 15, '#4af', 3);
             screenShake = 4;
@@ -1305,9 +1567,17 @@ function updateWaterBoss() {
     }
 
     // Boss碰撞玩家（跳跃和水中冲刺阶段）
-    if (!player.dead && player.invincible <= 0 && (wb.phase === 'leap' || wb.phase === 'swim')) {
-        const ph = getPlayerHitbox();
+    if (!player.dead && !player.spectating && player.invincible <= 0 && (wb.phase === 'leap' || wb.phase === 'swim')) {
+        const ph = getPlayerHitbox(player);
         if (rectCollide(ph, wb)) {
+            currentUpdatePlayer = player;
+            playerDie();
+        }
+    }
+    if (coopMode && coopPlayer2 && !coopPlayer2.dead && !coopPlayer2.spectating && coopPlayer2.invincible <= 0 && (wb.phase === 'leap' || wb.phase === 'swim')) {
+        const ph2 = getPlayerHitbox(coopPlayer2);
+        if (rectCollide(ph2, wb)) {
+            currentUpdatePlayer = coopPlayer2;
             playerDie();
         }
     }
@@ -1806,6 +2076,19 @@ let battleState = 'idle'; // idle, waiting, matched, countdown, playing, finishe
 let opponentResult = null;
 let battleResult = null;
 
+// 协同模式
+let coopMode = false;
+let coopRole = '';              // 'host' or 'guest'
+let coopPlayer2 = null;
+let coopInputQueue = [];        // host: buffered guest inputs
+let coopStateFromHost = null;   // guest: latest state from host
+let coopSendTimer = 0;          // host: throttle state sends to 30Hz
+let coopStatePrev = null;       // guest: previous state for interpolation
+let coopInterpT = 0;            // guest: interpolation progress 0~1
+let coopInterpFrame = 0;        // guest: frames since last state update
+let levelSeed = 0;
+let currentUpdatePlayer = null; // 指向当前正在更新的玩家对象
+
 // 暴风雨系统
 let stormTimer = 0;
 let lightningFlash = 0;      // 闪电亮度 0~1
@@ -1893,6 +2176,8 @@ function initGame() {
         inWater: false,
         submerged: false,
         jumpCount: 0,
+        lives: 3,
+        spectating: false,
     };
 
     bullets = [];
@@ -1903,7 +2188,7 @@ function initGame() {
     ripples = [];
     camera = { x: 0 };
     score = 0;
-    lives = 3;
+    lives = coopMode ? 0 : 3; // co-op mode uses player.lives instead
     screenShake = 0;
     bossTriggered = false;
     boss = null;
@@ -1976,18 +2261,18 @@ function generateBoltSegments(x1, y1, x2, y2, depth, maxDepth, segments) {
 }
 
 // 获取玩家当前碰撞箱（考虑蹲下和空中缩成一团）
-function getPlayerHitbox() {
-    if (player.submerged) {
-        // 潜入水中：保持原始碰撞箱（Boss和鱼雷仍可命中）
-        return { x: player.x, y: player.y, w: player.w, h: player.h };
+function getPlayerHitbox(p) {
+    const pl = p || player;
+    if (pl.submerged) {
+        return { x: pl.x, y: pl.y, w: pl.w, h: pl.h };
     }
-    const isCurled = !easyMode && !player.onGround && (player.jumping || player.vy !== 0);
-    if (player.ducking) {
-        return { x: player.x - 8, y: player.y + player.h - 10, w: 36, h: 10 };
+    const isCurled = !easyMode && !pl.onGround && (pl.jumping || pl.vy !== 0);
+    if (pl.ducking) {
+        return { x: pl.x - 8, y: pl.y + pl.h - 10, w: 36, h: 10 };
     } else if (isCurled) {
-        return { x: player.x, y: player.y + player.h - 24, w: player.w, h: 24 };
+        return { x: pl.x, y: pl.y + pl.h - 24, w: pl.w, h: 24 };
     }
-    return { x: player.x, y: player.y, w: player.w, h: player.h };
+    return { x: pl.x, y: pl.y, w: pl.w, h: pl.h };
 }
 
 function getTile(x, y) {
@@ -2013,6 +2298,15 @@ function spawnRipple(x, y) {
     ripples.push({ x, y, r: 3, maxR: 18 + Math.random() * 8, alpha: 0.6, growing: true });
 }
 
+// ========== 协同模式：获取最近玩家目标 ==========
+function getNearestPlayerTarget(fromX, fromY) {
+    if (!coopMode || !coopPlayer2 || coopPlayer2.dead || coopPlayer2.spectating) return player;
+    if (player.dead || player.spectating) return coopPlayer2;
+    const d1 = (player.x - fromX) ** 2 + (player.y - fromY) ** 2;
+    const d2 = (coopPlayer2.x - fromX) ** 2 + (coopPlayer2.y - fromY) ** 2;
+    return d1 <= d2 ? player : coopPlayer2;
+}
+
 // 在指定位置左侧找到安全的重生位置（有实心地面且头顶无障碍）
 function findSafeRespawn(deathX) {
     const groundY = Math.floor(H / TILE) - 2;
@@ -2028,6 +2322,31 @@ function findSafeRespawn(deathX) {
 }
 
 // ========== 玩家物理 ==========
+function updateCoopPlayer2() {
+    if (!coopPlayer2 || coopPlayer2.dead || coopPlayer2.spectating) return;
+    if (coopInputQueue.length === 0) return; // 没有Guest输入，跳过本帧
+    // 临时交换：将全局player指向coopPlayer2，模拟Guest输入
+    const _origPlayer = player;
+    player = coopPlayer2;
+    // 解码Guest输入并注入keys对象
+    const _origKeys = { ...keys };
+    const latest = coopInputQueue[coopInputQueue.length - 1];
+    const gk = decodeCoopInput(latest.k);
+    keys['ArrowUp'] = gk.up; keys['KeyW'] = gk.up;
+    keys['ArrowDown'] = gk.down; keys['KeyS'] = gk.down;
+    keys['ArrowLeft'] = gk.left; keys['KeyA'] = gk.left;
+    keys['ArrowRight'] = gk.right; keys['KeyD'] = gk.right;
+    keys['KeyK'] = gk.jump; keys['Space'] = gk.jump;
+    keys['KeyX'] = gk.fire; keys['KeyJ'] = gk.fire;
+    coopInputQueue = [];
+    currentUpdatePlayer = coopPlayer2;
+    updatePlayer();
+    currentUpdatePlayer = null;
+    // 恢复
+    player = _origPlayer;
+    Object.assign(keys, _origKeys);
+}
+
 function updatePlayer() {
     if (player.dead) return;
 
@@ -2311,31 +2630,56 @@ function updatePlayer() {
         }
     }
 
-    // 关卡滚动
-    if (cameraLocked) {
-        camera.x = cameraLockX;
-    } else {
-        const targetCamX = player.x - W / 3;
-        camera.x += (targetCamX - camera.x) * 0.1;
-        if (camera.x < 0) camera.x = 0;
-        const maxCam = LEVEL_WIDTH * TILE - W;
-        if (camera.x > maxCam) camera.x = maxCam;
+    // 关卡滚动（仅主玩家或非协同模式时更新相机）
+    if (!coopMode || currentUpdatePlayer === player) {
+        if (cameraLocked) {
+            camera.x = cameraLockX;
+        } else if (coopMode && coopPlayer2 && !coopPlayer2.dead) {
+            // 协同模式：相机跟踪两人
+            const p1x = player.x + player.w / 2;
+            const p2x = coopPlayer2.x + coopPlayer2.w / 2;
+            const center = (p1x + p2x) / 2;
+            const rightBias = Math.max(p1x, p2x);
+            const targetCenter = center * 0.4 + rightBias * 0.6;
+            let targetCamX = targetCenter - W / 2;
+            const margin = 100;
+            const minX = Math.min(p1x, p2x) - margin;
+            const maxX = Math.max(p1x, p2x) + margin - W;
+            if (targetCamX < minX) targetCamX = minX;
+            if (targetCamX > maxX && maxX > minX) targetCamX = maxX;
+            camera.x += (targetCamX - camera.x) * 0.1;
+            if (camera.x < 0) camera.x = 0;
+            const maxCam = LEVEL_WIDTH * TILE - W;
+            if (camera.x > maxCam) camera.x = maxCam;
+        } else {
+            const targetCamX = player.x - W / 3;
+            camera.x += (targetCamX - camera.x) * 0.1;
+            if (camera.x < 0) camera.x = 0;
+            const maxCam = LEVEL_WIDTH * TILE - W;
+            if (camera.x > maxCam) camera.x = maxCam;
+        }
     }
 
-    // Boss触发
-    if (!bossTriggered && player.x > (LEVEL_WIDTH - 12) * TILE) {
-        bossTriggered = true;
-        boss = createBoss((LEVEL_WIDTH - 5) * TILE, (Math.floor(H / TILE) - 2) * TILE);
-        // 清除屏幕上的小兵
-        enemies.forEach(e => { if (e.x < camera.x + W + 200) e.active = true; });
+    // Boss触发（任一玩家到达触发区域）
+    if (!bossTriggered) {
+        const triggerX = (LEVEL_WIDTH - 12) * TILE;
+        if (player.x > triggerX || (coopPlayer2 && coopPlayer2.x > triggerX)) {
+            bossTriggered = true;
+            boss = createBoss((LEVEL_WIDTH - 5) * TILE, (Math.floor(H / TILE) - 2) * TILE);
+            enemies.forEach(e => { if (e.x < camera.x + W + 200) e.active = true; });
+        }
     }
 
     // 水路Boss触发
-    if (!waterBoss && !waterBossIntro && player.x > 130 * TILE && player.x < 158 * TILE) {
-        waterBossIntro = true;
-        waterBoss = createWaterBoss(camera.x);
-        cameraLocked = true;
-        cameraLockX = camera.x;
+    if (!waterBoss && !waterBossIntro) {
+        const inZone = (player.x > 130 * TILE && player.x < 158 * TILE) ||
+                       (coopPlayer2 && coopPlayer2.x > 130 * TILE && coopPlayer2.x < 158 * TILE);
+        if (inZone) {
+            waterBossIntro = true;
+            waterBoss = createWaterBoss(camera.x);
+            cameraLocked = true;
+            cameraLockX = camera.x;
+        }
     }
 }
 
@@ -2535,7 +2879,15 @@ function firePlayerBullet() {
     }
 
     // 只有子弹实际射出时才播放音效
-    if (fired) playSound(sfxMap[player.weapon] || 'shoot');
+    if (fired) {
+        playSound(sfxMap[player.weapon] || 'shoot');
+        // 标记子弹归属
+        if (coopMode && currentUpdatePlayer === coopPlayer2) {
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                if (!bullets[i].owner) bullets[i].owner = 'p2';
+            }
+        }
+    }
 }
 
 function updateBullets() {
@@ -2639,7 +2991,11 @@ function updateBullets() {
                         state = 'victory';
                         stopBGM();
                         victoryTimer = 180;
-                        if (multiplayerMode) sendBattleResult('victory');
+                        if (coopMode && coopRole === 'host') {
+                            ws.send(JSON.stringify({ type: 'coop_victory', score: score, frames: frameCount }));
+                        } else if (multiplayerMode) {
+                            sendBattleResult('victory');
+                        }
                     }
                 }
             }
@@ -2738,7 +3094,11 @@ function updateBullets() {
                     state = 'victory';
                     stopBGM();
                     victoryTimer = 180;
-                    if (multiplayerMode) sendBattleResult('victory');
+                    if (coopMode && coopRole === 'host') {
+                        ws.send(JSON.stringify({ type: 'coop_victory', score: score, frames: frameCount }));
+                    } else if (multiplayerMode) {
+                        sendBattleResult('victory');
+                    }
                 }
                 hit = true;
             }
@@ -2793,8 +3153,9 @@ function updateBullets() {
 // ========== 敌人子弹 ==========
 function enemyFire(e) {
     const speed = 2.2;
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -2811,8 +3172,9 @@ function enemyFire(e) {
 // 炮台特殊子弹 - 三向散射
 function turretFire(e) {
     const speed = 2.8;
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -2846,8 +3208,9 @@ function turretFire(e) {
 // 喷火器 - 短程火焰
 function flamerFire(e) {
     const speed = 3.5;
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -2871,8 +3234,9 @@ function flamerFire(e) {
 // 闪电枪 - 快速直线闪电
 function lightningFire(e) {
     const speed = 5;
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -2892,8 +3256,9 @@ function lightningFire(e) {
 // 重装兵 - 大口径子弹
 function heavyFire(e) {
     const speed = 2;
-    let dx = player.x - e.x;
-    let dy = player.y - e.y;
+    const tgt = getNearestPlayerTarget(e.x, e.y);
+    let dx = tgt.x - e.x;
+    let dy = tgt.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 10) return;
     dx /= dist; dy /= dist;
@@ -2939,21 +3304,42 @@ function updateEnemyBullets() {
         }
 
         // 碰撞玩家（鱼雷在水中也能命中，其他子弹潜水时不受击）
-        const canHit = !player.submerged || b.type === 'torpedo';
-        if (!player.dead && player.invincible <= 0 && canHit) {
-            const ph = getPlayerHitbox();
+        let hitSomeone = false;
+        // 检查玩家1
+        const canHit1 = !player.submerged || b.type === 'torpedo';
+        if (!player.dead && !player.spectating && player.invincible <= 0 && canHit1) {
+            const ph = getPlayerHitbox(player);
             if (rectCollide(b, ph)) {
                 if (b.type === 'torpedo') {
-                    // 鱼雷爆炸效果
                     spawnParticles(b.x + b.w / 2, b.y + b.h / 2, 20, '#f80', 5);
                     spawnParticles(b.x + b.w / 2, b.y + b.h / 2, 10, '#ff0', 4);
-                    spawnParticles(b.x + b.w / 2, b.y + b.h / 2, 8, '#f00', 3);
                     screenShake = 8;
                     playSound('explosion');
                 }
+                currentUpdatePlayer = player;
                 playerDie();
-                enemyBullets.splice(i, 1);
+                hitSomeone = true;
             }
+        }
+        // 检查玩家2
+        if (!hitSomeone && coopMode && coopPlayer2 && !coopPlayer2.dead && !coopPlayer2.spectating && coopPlayer2.invincible <= 0) {
+            const canHit2 = !coopPlayer2.submerged || b.type === 'torpedo';
+            if (canHit2) {
+                const ph2 = getPlayerHitbox(coopPlayer2);
+                if (rectCollide(b, ph2)) {
+                    if (b.type === 'torpedo') {
+                        spawnParticles(b.x + b.w / 2, b.y + b.h / 2, 20, '#f80', 5);
+                        screenShake = 8;
+                        playSound('explosion');
+                    }
+                    currentUpdatePlayer = coopPlayer2;
+                    playerDie();
+                    hitSomeone = true;
+                }
+            }
+        }
+        if (hitSomeone) {
+            enemyBullets.splice(i, 1);
         }
     }}
 
@@ -2980,7 +3366,8 @@ function updateEnemies() {
             // 炮台特殊射击（三向散射）
             e.fireTimer--;
             if (e.fireTimer <= 0) {
-                const dist = Math.sqrt((player.x - e.x) ** 2 + (player.y - e.y) ** 2);
+                const tgt = getNearestPlayerTarget(e.x, e.y);
+                const dist = Math.sqrt((tgt.x - e.x) ** 2 + (tgt.y - e.y) ** 2);
                 if (dist < 400) {
                     turretFire(e);
                 }
@@ -2999,9 +3386,10 @@ function updateEnemies() {
                 // 射击
                 e.fireTimer--;
                 if (e.fireTimer <= 0) {
-                    const dist = Math.sqrt((player.x - e.x) ** 2 + (player.y - e.y) ** 2);
+                    const tgt = getNearestPlayerTarget(e.x, e.y);
+                    const dist = Math.sqrt((tgt.x - e.x) ** 2 + (tgt.y - e.y) ** 2);
                     if (dist < 400) {
-                        e.dir = player.x < e.x ? -1 : 1;
+                        e.dir = tgt.x < e.x ? -1 : 1;
                         enemyFire(e);
                     }
                     e.fireTimer = 40 + Math.random() * 30;
@@ -3021,7 +3409,8 @@ function updateEnemies() {
             // 水中减速
             if (e.inWater) patrolSpeed *= 2 / 3;
 
-            const distToPlayer = Math.sqrt((player.x - e.x) ** 2 + (player.y - e.y) ** 2);
+            const _nearestP = getNearestPlayerTarget(e.x, e.y);
+            const distToPlayer = Math.sqrt((_nearestP.x - e.x) ** 2 + (_nearestP.y - e.y) ** 2);
 
             // 水平移动（保持生成方向，撞墙才回头）
             e.vx = e.dir * patrolSpeed;
@@ -3051,7 +3440,7 @@ function updateEnemies() {
 
             // 敌人跳跃：撞墙或玩家在上方时跳跃
             if (e.onGround) {
-                const shouldJump = wallBlocked || (distToPlayer < 250 && player.y < e.y - 40);
+                const shouldJump = wallBlocked || (distToPlayer < 250 && _nearestP.y < e.y - 40);
                 if (shouldJump && Math.random() < 0.05) {
                     e.vy = -7; // 类似玩家的跳跃力
                     e.onGround = false;
@@ -3119,17 +3508,17 @@ function updateEnemies() {
             // 空降兵降落逻辑
             if (e.type === 'paratrooper' && e.parachuting) {
                 // 向玩家方向水平飘移
-                if (player.x < e.x - 5) {
+                if (_nearestP.x < e.x - 5) {
                     e.x -= e.driftSpeed;
                     e.dir = -1;
-                } else if (player.x > e.x + 5) {
+                } else if (_nearestP.x > e.x + 5) {
                     e.x += e.driftSpeed;
                     e.dir = 1;
                 }
                 // 空中射击
                 e.fireTimer--;
                 if (e.fireTimer <= 0) {
-                    const distToPlayer2 = Math.sqrt((player.x - e.x) ** 2 + (player.y - e.y) ** 2);
+                    const distToPlayer2 = Math.sqrt((_nearestP.x - e.x) ** 2 + (_nearestP.y - e.y) ** 2);
                     if (distToPlayer2 < 300) {
                         paratrooperFire(e);
                     }
@@ -3202,9 +3591,17 @@ function updateEnemies() {
         }
 
         // 碰撞玩家（完全潜入水中时不被击中）
-        if (!player.dead && player.invincible <= 0 && !player.submerged) {
-            const ph = getPlayerHitbox();
+        if (!player.dead && !player.spectating && player.invincible <= 0 && !player.submerged) {
+            const ph = getPlayerHitbox(player);
             if (rectCollide(ph, e)) {
+                currentUpdatePlayer = player;
+                playerDie();
+            }
+        }
+        if (coopMode && coopPlayer2 && !coopPlayer2.dead && !coopPlayer2.spectating && coopPlayer2.invincible <= 0 && !coopPlayer2.submerged) {
+            const ph2 = getPlayerHitbox(coopPlayer2);
+            if (rectCollide(ph2, e)) {
+                currentUpdatePlayer = coopPlayer2;
                 playerDie();
             }
         }
@@ -3230,7 +3627,8 @@ function updateBoss() {
             boss.x += Math.sin(boss.animTimer * 0.03) * 2;
             break;
         case 1: // 冲向玩家
-            const dx = player.x < boss.x ? -1.5 : 1.5;
+            const _bossTgt = getNearestPlayerTarget(boss.x, boss.y);
+            const dx = _bossTgt.x < boss.x ? -1.5 : 1.5;
             boss.x += dx;
             break;
         case 2: // 停止射击
@@ -3239,11 +3637,12 @@ function updateBoss() {
 
     // 射击
     if (boss.fireTimer <= 0) {
+        const _bossAim = getNearestPlayerTarget(boss.x, boss.y);
         const patterns = [
             // 散射
             () => {
                 for (let a = -0.6; a <= 0.6; a += 0.3) {
-                    const angle = Math.atan2(player.y - boss.y, player.x - boss.x) + a;
+                    const angle = Math.atan2(_bossAim.y - boss.y, _bossAim.x - boss.x) + a;
                     enemyBullets.push({
                         x: boss.x + boss.w/2, y: boss.y + boss.h/2,
                         vx: Math.cos(angle) * 2.5, vy: Math.sin(angle) * 2.5,
@@ -3253,7 +3652,7 @@ function updateBoss() {
             },
             // 直射
             () => {
-                const angle = Math.atan2(player.y - boss.y, player.x - boss.x);
+                const angle = Math.atan2(_bossAim.y - boss.y, _bossAim.x - boss.x);
                 for (let i = 0; i < 3; i++) {
                     setTimeout(() => {
                         if (boss.alive) {
@@ -3272,9 +3671,17 @@ function updateBoss() {
     }
 
     // Boss碰撞玩家
-    if (!player.dead && player.invincible <= 0) {
-        const ph = getPlayerHitbox();
+    if (!player.dead && !player.spectating && player.invincible <= 0) {
+        const ph = getPlayerHitbox(player);
         if (rectCollide(ph, boss)) {
+            currentUpdatePlayer = player;
+            playerDie();
+        }
+    }
+    if (coopMode && coopPlayer2 && !coopPlayer2.dead && !coopPlayer2.spectating && coopPlayer2.invincible <= 0) {
+        const ph2 = getPlayerHitbox(coopPlayer2);
+        if (rectCollide(ph2, boss)) {
+            currentUpdatePlayer = coopPlayer2;
             playerDie();
         }
     }
@@ -3307,10 +3714,11 @@ function updatePowerups() {
         if (p.life <= 0) { powerups.splice(i, 1); continue; }
 
         // 玩家拾取
-        if (rectCollide(player, p)) {
+        let collected = false;
+        if (!player.dead && !player.spectating && rectCollide(player, p)) {
             playSound('powerup');
             if (p.type === 'life') {
-                lives++;
+                if (coopMode) player.lives++; else lives++;
             } else {
                 player.weapon = p.type;
                 if (!player.obtainedWeapons.includes(p.type)) {
@@ -3318,6 +3726,22 @@ function updatePowerups() {
                 }
             }
             score += 1000;
+            collected = true;
+        }
+        if (!collected && coopMode && coopPlayer2 && !coopPlayer2.dead && !coopPlayer2.spectating && rectCollide(coopPlayer2, p)) {
+            playSound('powerup');
+            if (p.type === 'life') {
+                coopPlayer2.lives++;
+            } else {
+                coopPlayer2.weapon = p.type;
+                if (!coopPlayer2.obtainedWeapons.includes(p.type)) {
+                    coopPlayer2.obtainedWeapons.push(p.type);
+                }
+            }
+            score += 1000;
+            collected = true;
+        }
+        if (collected) {
             powerups.splice(i, 1);
         }
     }
@@ -3325,52 +3749,71 @@ function updatePowerups() {
 
 // ========== 玩家死亡 ==========
 function playerDie() {
-    if (player.invincible > 0 || player.dead) return;
-    player.dead = true;
-    lives--;
+    const p = coopMode ? currentUpdatePlayer : player;
+    if (!p || p.invincible > 0 || p.dead) return;
+    p.dead = true;
+    if (coopMode) {
+        p.lives--;
+    } else {
+        lives--;
+    }
     playSound('die');
-    spawnParticles(player.x + player.w/2, player.y + player.h/2, 20, '#f44', 5);
+    spawnParticles(p.x + p.w/2, p.y + p.h/2, 20, '#f44', 5);
     screenShake = 10;
 
-    if (lives <= 0) {
-        setTimeout(() => {
-            stopBGM();
-            if (score > hiScore) hiScore = score;
-            if (multiplayerMode) {
-                sendBattleResult('gameover');
-                document.getElementById('waitingOverlay').style.display = 'flex';
-            } else {
-                state = 'gameover';
-                document.getElementById('finalScore').textContent = score;
-                document.getElementById('gameOverScreen').style.display = 'flex';
+    const remainingLives = coopMode ? p.lives : lives;
+
+    if (remainingLives <= 0) {
+        // 该玩家生命耗尽
+        if (coopMode) {
+            p.spectating = true;
+            // 检查是否双方都game over
+            const bothDead = player.spectating && coopPlayer2 && coopPlayer2.spectating;
+            if (bothDead) {
+                setTimeout(() => {
+                    stopBGM();
+                    if (coopRole === 'host' && ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'coop_gameover', score: score }));
+                    }
+                }, 1000);
             }
-        }, 1000);
+        } else {
+            setTimeout(() => {
+                stopBGM();
+                if (score > hiScore) hiScore = score;
+                if (multiplayerMode) {
+                    sendBattleResult('gameover');
+                    document.getElementById('waitingOverlay').style.display = 'flex';
+                } else {
+                    state = 'gameover';
+                    document.getElementById('finalScore').textContent = score;
+                    document.getElementById('gameOverScreen').style.display = 'flex';
+                }
+            }, 1000);
+        }
     } else {
-        const deathX = player.x;
-        const deathInWater = player.inWater;
-        const deathOnGround = player.onGround;
+        const deathX = p.x;
+        const deathInWater = p.inWater;
+        const deathOnGround = p.onGround;
         setTimeout(() => {
-            player.dead = false;
-            player.invincible = 120;
-            player.submerged = false;
-            player.inWater = false;
+            p.dead = false;
+            p.invincible = 120;
+            p.submerged = false;
+            p.inWater = false;
             if (deathInWater) {
-                // 在水中死亡：原地复活
                 const waterGroundY = Math.floor(H / TILE) - 2;
-                player.x = deathX;
-                player.y = waterGroundY * TILE - player.h / 2;
+                p.x = deathX;
+                p.y = waterGroundY * TILE - p.h / 2;
             } else if (deathOnGround) {
-                // 在陆地死亡：原地复活
-                player.x = deathX;
-                player.y = findSafeRespawn(deathX).y;
+                p.x = deathX;
+                p.y = findSafeRespawn(deathX).y;
             } else {
-                // 在空中死亡：找左侧最近陆地复活
                 const safe = findSafeRespawn(deathX);
-                player.x = safe.x;
-                player.y = safe.y;
+                p.x = safe.x;
+                p.y = safe.y;
             }
-            player.vy = 0;
-            player.vx = 0;
+            p.vy = 0;
+            p.vx = 0;
         }, 800);
     }
 }
@@ -3946,21 +4389,26 @@ function drawLevel(camX) {
 }
 
 function drawPlayer(camX) {
-    if (player.dead) return;
-    if (player.invincible > 0 && player.invincible % 4 < 2) return;
+    drawPlayerSprite(camX, player, { body: '#4488ff', helmet: '#4466aa', leg: '#3366cc', skin: '#ffcc88' });
+}
 
-    const px = player.x - camX;
-    const py = player.y;
-    const facing = player.dir;
-    const isCurled = !easyMode && !player.onGround && (player.jumping || player.vy !== 0);
+function drawPlayer2(camX) {
+    if (!coopMode || !coopPlayer2) return;
+    drawPlayerSprite(camX, coopPlayer2, { body: '#ff4444', helmet: '#aa3333', leg: '#cc3333', skin: '#ffcc88' });
+}
 
-    // 完全潜入水中时完全不可见（只有水面波纹显示位置）
-    if (player.submerged) {
-        return;
-    }
+function drawPlayerSprite(camX, p, c) {
+    if (p.dead) return;
+    if (p.invincible > 0 && p.invincible % 4 < 2) return;
 
-    // 半身在水中：裁剪掉水中部分
-    if (player.inWater) {
+    const px = p.x - camX;
+    const py = p.y;
+    const facing = p.dir;
+    const isCurled = !easyMode && !p.onGround && (p.jumping || p.vy !== 0);
+
+    if (p.submerged) return;
+
+    if (p.inWater) {
         const waterGroundY = Math.floor(H / TILE) - 2;
         const waterSurfaceY = waterGroundY * TILE;
         ctx.save();
@@ -3969,74 +4417,45 @@ function drawPlayer(camX) {
         ctx.clip();
     }
 
-    if (player.ducking) {
-        // === 趴下：水平绘制，宽36 高10 ===
-        const bodyBottom = py + player.h; // 脚底位置
+    if (p.ducking) {
+        const bodyBottom = py + p.h;
         const proneTop = bodyBottom - 10;
-        const groundY = bodyBottom - 2; // 贴地位置
-
+        const groundY = bodyBottom - 2;
         ctx.save();
-        // 简单模式天使翅膀（趴下时）
-        if (easyMode) {
-            const wingCenterY = proneTop + 5;
-            if (facing > 0) {
-                ctx.save();
-                ctx.translate(px + 4, wingCenterY);
-                ctx.scale(0.6, 0.6);
-                drawAngelWings(1);
-                ctx.restore();
-            } else {
-                ctx.save();
-                ctx.translate(px + 20, wingCenterY);
-                ctx.scale(-0.6, 0.6);
-                drawAngelWings(1);
-                ctx.restore();
-            }
-        }
         if (facing > 0) {
-            // 身体
-            ctx.fillStyle = '#4488ff';
+            ctx.fillStyle = c.body;
             ctx.fillRect(px - 8, proneTop + 1, 32, 8);
-            // 头
-            ctx.fillStyle = '#ffcc88';
+            ctx.fillStyle = c.skin;
             ctx.fillRect(px + 22, proneTop + 1, 10, 8);
-            // 头盔
-            ctx.fillStyle = '#4466aa';
+            ctx.fillStyle = c.helmet;
             ctx.fillRect(px + 22, proneTop, 12, 4);
-            // 脚（在身后）
-            ctx.fillStyle = '#3366cc';
+            ctx.fillStyle = c.leg;
             ctx.fillRect(px - 12, proneTop + 2, 6, 7);
             ctx.fillRect(px - 5, proneTop + 2, 6, 7);
-            // 枪（贴着地面）
             ctx.save();
             ctx.translate(px + 20, groundY);
             let gunAngle = 0;
-            if (player.aimDiag) gunAngle = -Math.PI / 4;
-            else if (player.aimingUp) gunAngle = -Math.PI / 2;
+            if (p.aimDiag) gunAngle = -Math.PI / 4;
+            else if (p.aimingUp) gunAngle = -Math.PI / 2;
             ctx.rotate(gunAngle);
             ctx.fillStyle = '#888';
             ctx.fillRect(0, -2, 16, 4);
             ctx.restore();
         } else {
-            // 身体
-            ctx.fillStyle = '#4488ff';
+            ctx.fillStyle = c.body;
             ctx.fillRect(px - 4, proneTop + 1, 32, 8);
-            // 头（朝左，头在左端）
-            ctx.fillStyle = '#ffcc88';
+            ctx.fillStyle = c.skin;
             ctx.fillRect(px - 14, proneTop + 1, 10, 8);
-            // 头盔
-            ctx.fillStyle = '#4466aa';
+            ctx.fillStyle = c.helmet;
             ctx.fillRect(px - 16, proneTop, 12, 4);
-            // 脚（在身后）
-            ctx.fillStyle = '#3366cc';
+            ctx.fillStyle = c.leg;
             ctx.fillRect(px + 26, proneTop + 2, 6, 7);
             ctx.fillRect(px + 33, proneTop + 2, 6, 7);
-            // 枪（贴着地面）
             ctx.save();
             ctx.translate(px - 12, groundY);
             let gunAngle = Math.PI;
-            if (player.aimDiag) gunAngle = -Math.PI * 3 / 4;
-            else if (player.aimingUp) gunAngle = -Math.PI / 2;
+            if (p.aimDiag) gunAngle = -Math.PI * 3 / 4;
+            else if (p.aimingUp) gunAngle = -Math.PI / 2;
             ctx.rotate(gunAngle);
             ctx.fillStyle = '#888';
             ctx.fillRect(0, -2, 16, 4);
@@ -4044,77 +4463,61 @@ function drawPlayer(camX) {
         }
         ctx.restore();
     } else if (isCurled) {
-        // === 空中翻滚 - 缩成一团 ===
         ctx.save();
-        ctx.translate(px + player.w/2, py + player.h/2);
+        ctx.translate(px + p.w/2, py + p.h/2);
         if (facing < 0) ctx.scale(-1, 1);
-        // 简单模式天使翅膀
-        if (easyMode) drawAngelWings(0.8);
-        ctx.fillStyle = '#4488ff';
+        ctx.fillStyle = c.body;
         ctx.beginPath();
         ctx.arc(0, 0, 12, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = '#ffcc88';
+        ctx.fillStyle = c.skin;
         ctx.beginPath();
         ctx.arc(0, -4, 8, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = '#4466aa';
+        ctx.fillStyle = c.helmet;
         ctx.fillRect(-8, -12, 16, 6);
-        ctx.strokeStyle = '#3366cc';
+        ctx.strokeStyle = c.leg;
         ctx.lineWidth = 2;
-        const rollAngle = player.animFrame * Math.PI / 3;
+        const rollAngle = p.animFrame * Math.PI / 3;
         ctx.beginPath();
         ctx.arc(0, 0, 14, rollAngle, rollAngle + Math.PI / 2);
         ctx.stroke();
         ctx.restore();
     } else {
-        // === 站立 ===
-        const bodyH = player.h;
+        const bodyH = p.h;
         ctx.save();
-        ctx.translate(px + player.w/2, py + player.h/2);
+        ctx.translate(px + p.w/2, py + p.h/2);
         if (facing < 0) ctx.scale(-1, 1);
-
-        // 简单模式天使翅膀
-        if (easyMode) drawAngelWings(1);
-
-        // 身体
-        ctx.fillStyle = '#4488ff';
+        ctx.fillStyle = c.body;
         ctx.fillRect(-8, -bodyH/2 + 4, 16, bodyH - 8);
-        // 头
-        ctx.fillStyle = '#ffcc88';
+        ctx.fillStyle = c.skin;
         ctx.fillRect(-6, -bodyH/2 - 4, 12, 10);
-        // 头盔
-        ctx.fillStyle = '#4466aa';
+        ctx.fillStyle = c.helmet;
         ctx.fillRect(-7, -bodyH/2 - 6, 14, 6);
-        // 腿
-        ctx.fillStyle = '#3366cc';
-        if (Math.abs(player.vx) > 0.5) {
-            const legOffset = Math.sin(player.animFrame * Math.PI / 2) * 4;
+        ctx.fillStyle = c.leg;
+        if (Math.abs(p.vx) > 0.5) {
+            const legOffset = Math.sin(p.animFrame * Math.PI / 2) * 4;
             ctx.fillRect(-5, bodyH/2 - 6, 4, 8 + legOffset);
             ctx.fillRect(1, bodyH/2 - 6, 4, 8 - legOffset);
         } else {
             ctx.fillRect(-5, bodyH/2 - 6, 4, 8);
             ctx.fillRect(1, bodyH/2 - 6, 4, 8);
         }
-
-        // 枪
         ctx.fillStyle = '#888';
         ctx.save();
         ctx.translate(2, -bodyH/2 + 6);
         let gunAngle = 0;
-        if (player.aimDiag) gunAngle = -Math.PI / 4;
-        else if (player.aimingUp) gunAngle = -Math.PI / 2;
-        else if (player.aimDiagDown) gunAngle = Math.PI / 4;
-        else if (player.aimDown) gunAngle = Math.PI / 2;
+        if (p.aimDiag) gunAngle = -Math.PI / 4;
+        else if (p.aimingUp) gunAngle = -Math.PI / 2;
+        else if (p.aimDiagDown) gunAngle = Math.PI / 4;
+        else if (p.aimDown) gunAngle = Math.PI / 2;
         ctx.rotate(gunAngle);
         ctx.fillRect(0, -2, 16, 4);
         ctx.restore();
-
         ctx.restore();
     }
 
-    // 恢复水中裁剪
-    if (player.inWater && !player.submerged) {
+    if (p.inWater && !p.submerged) {
         ctx.restore();
     }
 }
@@ -4599,36 +5002,88 @@ function drawHUD() {
     ctx.textAlign = 'center';
     ctx.fillText(`HI: ${Math.max(score, hiScore)}`, W/2, 24);
 
-    // 生命
-    ctx.textAlign = 'right';
-    ctx.fillStyle = '#f44';
-    ctx.fillText(`${lives}×♥`, W - 10, 24);
+    if (coopMode) {
+        // 协同模式：显示双方生命
+        // P1生命（蓝色，左侧）
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#4488ff';
+        ctx.font = 'bold 14px Courier New';
+        const p1Lives = coopRole === 'guest' && coopStateFromHost ? coopStateFromHost.p1.lives : player.lives;
+        ctx.fillText(`P1: ${p1Lives}♥`, 10, 44);
 
-    // 武器
-    ctx.textAlign = 'left';
-    ctx.font = '12px Courier New';
-    const weaponLabels = { spread: 'S', rapid: 'R', spiral: 'K', lightning: 'T', homing: 'H' };
-    let wx = 10;
-    for (const wp of player.obtainedWeapons) {
-        const label = weaponLabels[wp] || '?';
-        if (wp === player.weapon) {
-            ctx.fillStyle = '#ff0';
-            ctx.font = 'bold 14px Courier New';
-            ctx.fillText(label, wx, 44);
-            wx += 18;
-        } else {
-            ctx.fillStyle = '#888';
-            ctx.font = '12px Courier New';
-            ctx.fillText(label, wx, 44);
-            wx += 14;
-        }
-    }
+        // P2生命（红色，右侧）
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#ff4444';
+        const p2Lives = coopPlayer2 ? coopPlayer2.lives : 3;
+        ctx.fillText(`P2: ${p2Lives}♥`, W - 10, 44);
 
-    // 简单模式标识
-    if (easyMode) {
+        // CO-OP标识
+        ctx.textAlign = 'center';
         ctx.fillStyle = '#0ff';
         ctx.font = 'bold 12px Courier New';
-        ctx.fillText('EASY MODE', 10, 62);
+        ctx.fillText('CO-OP', W/2, 44);
+
+        // 自己的武器栏
+        ctx.textAlign = 'left';
+        const weaponLabels = { spread: 'S', rapid: 'R', spiral: 'K', lightning: 'T', homing: 'H' };
+        let wx = 10;
+        for (const wp of player.obtainedWeapons) {
+            const label = weaponLabels[wp] || '?';
+            if (wp === player.weapon) {
+                ctx.fillStyle = '#ff0';
+                ctx.font = 'bold 14px Courier New';
+                ctx.fillText(label, wx, 62);
+                wx += 18;
+            } else {
+                ctx.fillStyle = '#888';
+                ctx.font = '12px Courier New';
+                ctx.fillText(label, wx, 62);
+                wx += 14;
+            }
+        }
+
+        // 观战提示
+        const localPlayer = coopRole === 'guest' ? coopPlayer2 : player;
+        if (localPlayer && localPlayer.spectating) {
+            ctx.fillStyle = 'rgba(0,0,0,0.4)';
+            ctx.fillRect(0, H - 40, W, 40);
+            ctx.fillStyle = '#f80';
+            ctx.font = 'bold 18px Courier New';
+            ctx.textAlign = 'center';
+            ctx.fillText('观战中 - 伙伴仍在战斗', W/2, H - 15);
+        }
+    } else {
+        // 非协同模式：原有生命显示
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#f44';
+        ctx.fillText(`${lives}×♥`, W - 10, 24);
+
+        // 武器
+        ctx.textAlign = 'left';
+        ctx.font = '12px Courier New';
+        const weaponLabels = { spread: 'S', rapid: 'R', spiral: 'K', lightning: 'T', homing: 'H' };
+        let wx = 10;
+        for (const wp of player.obtainedWeapons) {
+            const label = weaponLabels[wp] || '?';
+            if (wp === player.weapon) {
+                ctx.fillStyle = '#ff0';
+                ctx.font = 'bold 14px Courier New';
+                ctx.fillText(label, wx, 44);
+                wx += 18;
+            } else {
+                ctx.fillStyle = '#888';
+                ctx.font = '12px Courier New';
+                ctx.fillText(label, wx, 44);
+                wx += 14;
+            }
+        }
+
+        // 简单模式标识
+        if (easyMode) {
+            ctx.fillStyle = '#0ff';
+            ctx.font = 'bold 12px Courier New';
+            ctx.fillText('EASY MODE', 10, 62);
+        }
     }
 
     // Boss血条
@@ -4636,7 +5091,7 @@ function drawHUD() {
         ctx.fillStyle = '#fff';
         ctx.font = 'bold 14px Courier New';
         ctx.textAlign = 'center';
-        ctx.fillText('BOSS', W/2, 60);
+        ctx.fillText('BOSS', W/2, 80);
     }
 
     // 暂停提示
@@ -4667,6 +5122,177 @@ function drawHUD() {
 let lastTime = 0;
 let animFrame = 0;
 
+// ========== 协同模式：状态序列化 ==========
+function serializeCoopState() {
+    return {
+        p1: {
+            x: Math.round(player.x * 10) / 10,
+            y: Math.round(player.y * 10) / 10,
+            vx: Math.round(player.vx * 100) / 100,
+            vy: Math.round(player.vy * 100) / 100,
+            dir: player.dir, dead: player.dead, invincible: player.invincible,
+            ducking: player.ducking, aimingUp: player.aimingUp,
+            aimDiag: player.aimDiag, aimDiagDown: player.aimDiagDown,
+            aimDown: player.aimDown, weapon: player.weapon,
+            onGround: player.onGround, jumping: player.jumping,
+            animFrame: player.animFrame, inWater: player.inWater,
+            submerged: player.submerged, lives: player.lives,
+            spectating: player.spectating,
+        },
+        p2: coopPlayer2 ? {
+            x: Math.round(coopPlayer2.x * 10) / 10,
+            y: Math.round(coopPlayer2.y * 10) / 10,
+            vx: Math.round(coopPlayer2.vx * 100) / 100,
+            vy: Math.round(coopPlayer2.vy * 100) / 100,
+            dir: coopPlayer2.dir, dead: coopPlayer2.dead, invincible: coopPlayer2.invincible,
+            ducking: coopPlayer2.ducking, aimingUp: coopPlayer2.aimingUp,
+            aimDiag: coopPlayer2.aimDiag, aimDiagDown: coopPlayer2.aimDiagDown,
+            aimDown: coopPlayer2.aimDown, weapon: coopPlayer2.weapon,
+            onGround: coopPlayer2.onGround, jumping: coopPlayer2.jumping,
+            animFrame: coopPlayer2.animFrame, inWater: coopPlayer2.inWater,
+            submerged: coopPlayer2.submerged, lives: coopPlayer2.lives,
+            spectating: coopPlayer2.spectating,
+        } : null,
+        cx: Math.round(camera.x * 10) / 10,
+        lives: lives, score: score, shake: screenShake,
+        bossTriggered: bossTriggered,
+        cameraLocked: cameraLocked, cameraLockX: cameraLockX,
+        f: frameCount,
+        blt: bullets.map(b => ({
+            x: Math.round(b.x), y: Math.round(b.y),
+            vx: Math.round(b.vx * 10) / 10, vy: Math.round(b.vy * 10) / 10,
+            w: b.w, h: b.h, wt: b.weaponType, life: b.life,
+            owner: b.owner || 'p1', dmg: b.damage,
+        })),
+        eblt: enemyBullets.map(b => ({
+            x: Math.round(b.x), y: Math.round(b.y),
+            vx: Math.round(b.vx * 10) / 10, vy: Math.round(b.vy * 10) / 10,
+            w: b.w, h: b.h, type: b.type || '', special: !!b.special,
+        })),
+        enm: enemies.filter(e => e.alive && e.active).map(e => ({
+            x: Math.round(e.x), y: Math.round(e.y),
+            hp: e.hp, type: e.type, dir: e.dir, alive: e.alive,
+            peeking: !!e.peeking, parachuting: !!e.parachuting,
+        })),
+        boss: boss && boss.alive ? {
+            x: Math.round(boss.x), y: Math.round(boss.y),
+            hp: boss.hp, phase: boss.phase,
+        } : null,
+        wb: waterBoss && waterBoss.alive ? {
+            x: Math.round(waterBoss.x), y: Math.round(waterBoss.y),
+            hp: waterBoss.hp, phase: waterBoss.phase, facing: waterBoss.facing,
+        } : null,
+        pups: powerups.map(p => ({
+            x: Math.round(p.x), y: Math.round(p.y), type: p.type, life: p.life,
+        })),
+    };
+}
+
+// ========== 协同模式：Guest应用状态（带插值） ==========
+function applyCoopState(s) {
+    // 保存上一帧状态用于插值
+    coopStatePrev = {
+        p1: { x: player.x, y: player.y },
+        p2: coopPlayer2 ? { x: coopPlayer2.x, y: coopPlayer2.y } : null,
+        cx: camera.x,
+    };
+    coopInterpFrame = 0;
+
+    // Host状态（P1）直接应用
+    player.x = s.p1.x; player.y = s.p1.y;
+    player.vx = s.p1.vx; player.vy = s.p1.vy;
+    player.dir = s.p1.dir; player.dead = s.p1.dead;
+    player.invincible = s.p1.invincible; player.ducking = s.p1.ducking;
+    player.aimingUp = s.p1.aimingUp; player.aimDiag = s.p1.aimDiag;
+    player.aimDiagDown = s.p1.aimDiagDown; player.aimDown = s.p1.aimDown;
+    player.weapon = s.p1.weapon; player.onGround = s.p1.onGround;
+    player.jumping = s.p1.jumping; player.animFrame = s.p1.animFrame;
+    player.inWater = s.p1.inWater; player.submerged = s.p1.submerged;
+    player.lives = s.p1.lives; player.spectating = s.p1.spectating;
+
+    // Guest自己的角色（P2）：应用Host权威状态
+    if (s.p2) {
+        if (!coopPlayer2) coopPlayer2 = createPlayer2(s.p2.x, s.p2.y);
+        coopPlayer2.x = s.p2.x; coopPlayer2.y = s.p2.y;
+        coopPlayer2.vx = s.p2.vx; coopPlayer2.vy = s.p2.vy;
+        coopPlayer2.dir = s.p2.dir; coopPlayer2.dead = s.p2.dead;
+        coopPlayer2.invincible = s.p2.invincible; coopPlayer2.ducking = s.p2.ducking;
+        coopPlayer2.aimingUp = s.p2.aimingUp; coopPlayer2.aimDiag = s.p2.aimDiag;
+        coopPlayer2.aimDiagDown = s.p2.aimDiagDown; coopPlayer2.aimDown = s.p2.aimDown;
+        coopPlayer2.weapon = s.p2.weapon; coopPlayer2.onGround = s.p2.onGround;
+        coopPlayer2.jumping = s.p2.jumping; coopPlayer2.animFrame = s.p2.animFrame;
+        coopPlayer2.inWater = s.p2.inWater; coopPlayer2.submerged = s.p2.submerged;
+        coopPlayer2.lives = s.p2.lives; coopPlayer2.spectating = s.p2.spectating;
+    }
+
+    camera.x = s.cx; screenShake = s.shake; lives = s.lives; score = s.score;
+    bossTriggered = s.bossTriggered; cameraLocked = s.cameraLocked; cameraLockX = s.cameraLockX;
+
+    bullets = s.blt.map(b => ({
+        x: b.x, y: b.y, vx: b.vx, vy: b.vy,
+        w: b.w, h: b.h, weaponType: b.wt, life: b.life,
+        owner: b.owner, damage: b.dmg,
+    }));
+    enemyBullets = s.eblt.map(b => ({
+        x: b.x, y: b.y, vx: b.vx, vy: b.vy,
+        w: b.w, h: b.h, type: b.type, special: b.special,
+    }));
+
+    // 敌人：合并更新
+    const newEnemies = [];
+    for (const se of s.enm) {
+        let found = false;
+        for (const e of enemies) {
+            if (e.type === se.type && Math.abs(e.x - se.x) < 80) {
+                e.x = se.x; e.y = se.y; e.hp = se.hp;
+                e.dir = se.dir; e.alive = se.alive;
+                e.peeking = se.peeking; e.parachuting = se.parachuting;
+                found = true; break;
+            }
+        }
+        if (!found) {
+            newEnemies.push({
+                ...se, w: 24, h: 36, maxHp: se.hp,
+                active: true, animFrame: 0, animTimer: 0,
+                vx: 0, vy: 0, onGround: true,
+            });
+        }
+    }
+    enemies = enemies.filter(e => e.alive).concat(newEnemies);
+
+    if (s.boss) {
+        if (!boss) boss = createBoss(s.boss.x, s.boss.y);
+        boss.x = s.boss.x; boss.y = s.boss.y;
+        boss.hp = s.boss.hp; boss.phase = s.boss.phase; boss.alive = true;
+    } else if (boss) { boss.alive = false; }
+
+    if (s.wb) {
+        if (!waterBoss) waterBoss = { x: s.wb.x, y: s.wb.y, w: 120, h: 80, hp: s.wb.hp, phase: s.wb.phase, facing: s.wb.facing, alive: true, animTimer: 0 };
+        waterBoss.x = s.wb.x; waterBoss.y = s.wb.y;
+        waterBoss.hp = s.wb.hp; waterBoss.phase = s.wb.phase;
+        waterBoss.facing = s.wb.facing; waterBoss.alive = true;
+    }
+
+    powerups = s.pups.map(p => ({
+        x: p.x, y: p.y, w: 24, h: 24, type: p.type, vy: 0, life: p.life,
+    }));
+}
+
+// ========== Guest本地输入预测 ==========
+function guestLocalPredict() {
+    if (!coopPlayer2 || coopPlayer2.dead || coopPlayer2.spectating) return;
+    // 用Guest自己的输入本地运行物理，让操控感更即时
+    const _origPlayer = player;
+    player = coopPlayer2;
+    const _origKeys = { ...keys };
+    // keys已经是Guest自己的输入（本机键盘），直接用
+    currentUpdatePlayer = coopPlayer2;
+    updatePlayer();
+    currentUpdatePlayer = null;
+    player = _origPlayer;
+    Object.assign(keys, _origKeys);
+}
+
 function gameLoop(timestamp) {
     requestAnimationFrame(gameLoop);
 
@@ -4684,60 +5310,84 @@ function gameLoop(timestamp) {
 
     // 更新
     if (state === 'playing') {
-        frameCount++;
-        // 移动平台更新
-        for (const mp of movingPlatforms) {
-            const prevX = mp.x;
-            mp.x = mp.baseX + Math.sin(Date.now() * 0.001 * mp.speed) * mp.range;
-            mp.dx = mp.x - prevX;
-
-            // 平台与地形碰撞：检查平台四个角是否进入实心地形
-            let blocked = false;
-            const checkPoints = [
-                {x: mp.x, y: mp.y},
-                {x: mp.x + mp.w - 1, y: mp.y},
-                {x: mp.x, y: mp.y + 11},
-                {x: mp.x + mp.w - 1, y: mp.y + 11}
-            ];
-            for (const pt of checkPoints) {
-                if (isSolid(getTile(pt.x, pt.y))) {
-                    blocked = true;
-                    break;
+        if (coopMode && coopRole === 'guest') {
+            // Guest: 发送输入 + 应用Host状态 + 本地预测
+            frameCount++;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'coop_input', f: frameCount, k: encodeInput() }));
+            }
+            // 先应用Host权威状态（校正位置）
+            if (coopStateFromHost) {
+                applyCoopState(coopStateFromHost);
+                coopStateFromHost = null;
+            }
+            // 本地预测：用Guest自己的输入立即更新coopPlayer2
+            guestLocalPredict();
+            updateParticles();
+            coopInterpFrame++;
+        } else {
+            // Host或单人：完整模拟
+            frameCount++;
+            // 移动平台更新
+            for (const mp of movingPlatforms) {
+                const prevX = mp.x;
+                mp.x = mp.baseX + Math.sin(Date.now() * 0.001 * mp.speed) * mp.range;
+                mp.dx = mp.x - prevX;
+                let blocked = false;
+                const checkPoints = [
+                    {x: mp.x, y: mp.y},
+                    {x: mp.x + mp.w - 1, y: mp.y},
+                    {x: mp.x, y: mp.y + 11},
+                    {x: mp.x + mp.w - 1, y: mp.y + 11}
+                ];
+                for (const pt of checkPoints) {
+                    if (isSolid(getTile(pt.x, pt.y))) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) {
+                    mp.x = prevX;
+                    mp.dx = 0;
+                    mp.speed = -mp.speed;
                 }
             }
-            if (blocked) {
-                // 被地形挡住，回退并反转方向
-                mp.x = prevX;
-                mp.dx = 0;
-                mp.speed = -mp.speed;
+            updatePlayer();
+            if (coopMode && coopRole === 'host') {
+                updateCoopPlayer2();
+            }
+            updateBullets();
+            updateEnemies();
+            updateDynamicSpawn();
+            updateBoss();
+            updateWaterBoss();
+            updateEnemyBullets();
+            updatePowerups();
+            updateParticles();
+            for (let i = ripples.length - 1; i >= 0; i--) {
+                const r = ripples[i];
+                r.r += 0.8;
+                r.alpha -= 0.015;
+                if (r.alpha <= 0) ripples.splice(i, 1);
+            }
+            if (screenShake > 0) screenShake--;
+
+            // Host: 每帧发送状态给Guest (60Hz)
+            if (coopMode && coopRole === 'host') {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'coop_state', state: serializeCoopState() }));
+                }
             }
         }
-        updatePlayer();
-        updateBullets();
-        updateEnemies();
-        updateDynamicSpawn();
-        updateBoss();
-        updateWaterBoss();
-        updateEnemyBullets();
-        updatePowerups();
-        updateParticles();
-        // 更新波纹
-        for (let i = ripples.length - 1; i >= 0; i--) {
-            const r = ripples[i];
-            r.r += 0.8;
-            r.alpha -= 0.015;
-            if (r.alpha <= 0) ripples.splice(i, 1);
-        }
-
-        // 屏幕震动
-        if (screenShake > 0) screenShake--;
     }
 
     if (state === 'victory') {
         updateParticles();
         victoryTimer--;
         if (victoryTimer <= 0) {
-            if (multiplayerMode) {
+            if (coopMode) {
+                // 协同模式胜利由coop_victory消息处理
+            } else if (multiplayerMode) {
                 state = 'battleresult';
                 if (!battleResult) {
                     document.getElementById('battleResultTitle').textContent = '等待对手...';
@@ -4775,6 +5425,7 @@ function gameLoop(timestamp) {
     drawBoss(camera.x);
     drawWaterBoss(camera.x);
     drawPlayer(camera.x);
+    drawPlayer2(camera.x);
     drawBullets(camera.x);
     drawParticles(camera.x);
     // 绘制水面波纹
@@ -4831,6 +5482,10 @@ document.getElementById('btnSingle').addEventListener('click', () => {
 
 document.getElementById('btnBattle').addEventListener('click', () => {
     connectBattleServer();
+});
+
+document.getElementById('btnCoop').addEventListener('click', () => {
+    connectCoopServer();
 });
 
 // 启动

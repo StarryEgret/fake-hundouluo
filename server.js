@@ -24,6 +24,7 @@ const wss = new WebSocketServer({ server });
 
 // ========== 游戏房间状态 ==========
 let waitingPlayer = null;
+let waitingCoopPlayer = null;
 const rooms = new Map();
 let roomCounter = 0;
 
@@ -42,6 +43,11 @@ wss.on('connection', (ws) => {
             case 'result': handleResult(ws, msg); break;
             case 'rematch': handleRematch(ws); break;
             case 'end': handleEnd(ws); break;
+            case 'join_coop': handleJoinCoop(ws); break;
+            case 'coop_input': handleCoopInput(ws, msg); break;
+            case 'coop_state': handleCoopState(ws, msg); break;
+            case 'coop_gameover': handleCoopGameOver(ws, msg); break;
+            case 'coop_victory': handleCoopVictory(ws, msg); break;
         }
     });
 
@@ -79,6 +85,76 @@ function handleJoin(ws) {
     }
 }
 
+// ========== 协同模式匹配 ==========
+function handleJoinCoop(ws) {
+    if (waitingCoopPlayer && waitingCoopPlayer.readyState === 1) {
+        const roomId = 'coop_' + (++roomCounter);
+        const room = {
+            id: roomId,
+            mode: 'coop',
+            players: [waitingCoopPlayer, ws],
+            ready: [false, false],
+            seed: Math.floor(Math.random() * 999999),
+            state: 'matched',
+            countdownTimer: null
+        };
+
+        waitingCoopPlayer.playerIndex = 0;
+        waitingCoopPlayer.roomId = roomId;
+        ws.playerIndex = 1;
+        ws.roomId = roomId;
+
+        rooms.set(roomId, room);
+        waitingCoopPlayer = null;
+
+        for (let i = 0; i < 2; i++) {
+            room.players[i].send(JSON.stringify({ type: 'matched_coop', roomId, playerIndex: i }));
+        }
+    } else {
+        waitingCoopPlayer = ws;
+        ws.send(JSON.stringify({ type: 'waiting' }));
+    }
+}
+
+// ========== 协同输入转发 (guest→host) ==========
+function handleCoopInput(ws, msg) {
+    const room = rooms.get(ws.roomId);
+    if (!room || room.mode !== 'coop') return;
+    const host = room.players[0];
+    if (host.readyState === 1) {
+        host.send(JSON.stringify(msg));
+    }
+}
+
+// ========== 协同状态转发 (host→guest) ==========
+function handleCoopState(ws, msg) {
+    const room = rooms.get(ws.roomId);
+    if (!room || room.mode !== 'coop') return;
+    if (ws.playerIndex !== 0) return;
+    const guest = room.players[1];
+    if (guest.readyState === 1) {
+        guest.send(JSON.stringify(msg));
+    }
+}
+
+// ========== 协同游戏结束 ==========
+function handleCoopGameOver(ws, msg) {
+    const room = rooms.get(ws.roomId);
+    if (!room || room.mode !== 'coop') return;
+    broadcast(room, { type: 'coop_gameover', score: msg.score });
+    room.state = 'done';
+    room.cleanupTimer = setTimeout(() => rooms.delete(room.id), 30000);
+}
+
+// ========== 协同胜利 ==========
+function handleCoopVictory(ws, msg) {
+    const room = rooms.get(ws.roomId);
+    if (!room || room.mode !== 'coop') return;
+    broadcast(room, { type: 'coop_victory', score: msg.score, frames: msg.frames });
+    room.state = 'done';
+    room.cleanupTimer = setTimeout(() => rooms.delete(room.id), 30000);
+}
+
 // ========== 双方确认就绪 ==========
 function handleReady(ws) {
     const room = rooms.get(ws.roomId);
@@ -111,7 +187,11 @@ function startCountdown(room) {
         } else {
             clearInterval(room.countdownTimer);
             room.state = 'playing';
-            broadcast(room, { type: 'start' });
+            if (room.mode === 'coop') {
+                broadcast(room, { type: 'coop_start', seed: room.seed });
+            } else {
+                broadcast(room, { type: 'start' });
+            }
         }
     }, 1000);
 }
@@ -198,12 +278,29 @@ function handleDisconnect(ws) {
         waitingPlayer = null;
         return;
     }
+    if (waitingCoopPlayer === ws) {
+        waitingCoopPlayer = null;
+        return;
+    }
 
     const room = rooms.get(ws.roomId);
     if (!room) return;
 
     const otherIndex = 1 - ws.playerIndex;
     const other = room.players[otherIndex];
+
+    if (room.mode === 'coop') {
+        if (other.readyState === 1) {
+            if (ws.playerIndex === 0) {
+                other.send(JSON.stringify({ type: 'coop_host_disconnect' }));
+            } else {
+                other.send(JSON.stringify({ type: 'coop_partner_disconnect' }));
+            }
+        }
+        room.state = 'done';
+        room.cleanupTimer = setTimeout(() => rooms.delete(room.id), 30000);
+        return;
+    }
 
     if (room.state === 'playing' || room.state === 'countdown' || room.state === 'collecting') {
         if (!room.results[ws.playerIndex]) {
@@ -304,52 +401,61 @@ server.listen(PORT, () => {
 });
 
 // ========== 内网穿透 ==========
-async function startTunnel() {
-    // 方式1: 尝试使用 localtunnel（无需注册）
-    try {
-        const lt = require('localtunnel');
-        const tunnel = await lt({ port: PORT });
-        publicUrl = tunnel.url;
-        console.log(`\n========================================`);
-        console.log(`  公网地址（可分享给对手）:`);
-        console.log(`  ${tunnel.url}`);
-        console.log(`========================================\n`);
-        console.log(`  对手在浏览器打开此地址，点击"双人对战"即可匹配\n`);
+function startTunnel() {
+    const { spawn } = require('child_process');
+    const ssh = spawn('ssh', ['-o', 'StrictHostKeyChecking=no', '-R', `80:localhost:${PORT}`, 'localhost.run'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
 
-        tunnel.on('close', () => {
-            console.log('  内网穿透隧道已关闭');
-            publicUrl = '';
-        });
-    } catch {
-        // localtunnel 未安装，尝试 ngrok
-        try {
-            const ngrok = require('@ngrok/ngrok');
-            const listener = await ngrok.forward({ addr: PORT, authtoken_from_env: true });
-            publicUrl = listener.url();
+    let found = false;
+    const timeout = setTimeout(() => {
+        if (!found) {
+            console.log(`\n  [提示] localhost.run 连接超时，仅限局域网访问\n`);
+            printLanInfo();
+        }
+    }, 15000);
+
+    const parseUrl = (data) => {
+        const str = data.toString();
+        const match = str.match(/(https:\/\/[a-z0-9]+\.lhr\.life)/);
+        if (match && !found) {
+            found = true;
+            clearTimeout(timeout);
+            publicUrl = match[1];
             console.log(`\n========================================`);
             console.log(`  公网地址（可分享给对手）:`);
-            console.log(`  ${listener.url()}`);
+            console.log(`  ${match[1]}`);
             console.log(`========================================\n`);
-        } catch {
-            console.log(`  [提示] 未检测到内网穿透工具`);
-            console.log(`  如需公网联机，请执行以下任一操作:`);
-            console.log(`  `);
-            console.log(`  方式A: npm install localtunnel && node server.js`);
-            console.log(`  方式B: 另开终端运行 ngrok http ${PORT}`);
-            console.log(`  方式C: 同一局域网直接用本机IP访问`);
-            console.log(`  `);
-            console.log(`  `);
-            // 打印本机局域网 IP
-            const os = require('os');
-            const nets = os.networkInterfaces();
-            for (const name of Object.keys(nets)) {
-                for (const net of nets[name]) {
-                    if (net.family === 'IPv4' && !net.internal) {
-                        console.log(`  局域网地址: http://${net.address}:${PORT}`);
-                    }
-                }
+            console.log(`  对手在浏览器打开此地址，点击"双人对战"即可匹配\n`);
+        }
+    };
+
+    ssh.stdout.on('data', parseUrl);
+    ssh.stderr.on('data', parseUrl);
+
+    ssh.on('close', () => {
+        if (found) {
+            console.log('  内网穿透隧道已关闭');
+            publicUrl = '';
+        }
+    });
+}
+
+function printLanInfo() {
+    console.log(`========================================`);
+    console.log(`  如需公网联机，请执行以下任一操作:`);
+    console.log(`  `);
+    console.log(`  方式A: 同一局域网直接用本机IP访问（见下方）`);
+    console.log(`  方式B: 另开终端运行: ssh -R 80:localhost:3000 localhost.run`);
+    console.log(`  `);
+    const os = require('os');
+    const nets = os.networkInterfaces();
+    for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+            if (net.family === 'IPv4' && !net.internal) {
+                console.log(`  局域网地址: http://${net.address}:${PORT}`);
             }
-            console.log('');
         }
     }
+    console.log(`========================================\n`);
 }
